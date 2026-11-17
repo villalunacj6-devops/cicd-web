@@ -6,6 +6,8 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+
 permissions:
   contents: write
 
@@ -30,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
       # ==========================================
       # 2. INSTALL PHP
@@ -84,19 +87,21 @@ jobs:
 
           echo "PHP files checked: $COUNT"
 
+          echo "PHP files passed: $((COUNT - FAIL))"
+
           if [ "$COUNT" -eq 0 ]; then
-            echo "No PHP files found."
+            echo "ERROR: No PHP files found."
             exit 1
           fi
 
           if [ "$FAIL" -ne 0 ]; then
 
-            echo "PHP validation failed."
+            echo "ERROR: PHP syntax validation failed."
             exit 1
 
           fi
 
-          echo "All PHP files passed."
+          echo "SUCCESS: All PHP files passed."
 
       # ==========================================
       # 4. REVERT FAILED COMMIT IN GITHUB
@@ -104,27 +109,33 @@ jobs:
 
       - name: Revert Failed Commit
         if: failure() && steps.validate.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ github.token }}
 
         run: |
 
           echo "======================================"
-          echo "PHP TEST FAILED"
-          echo "REVERTING FAILED COMMIT"
+          echo "PHP VALIDATION FAILED"
+          echo "RESTORING PREVIOUS GITHUB VERSION"
           echo "======================================"
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Revert the failed commit
 
           git revert --no-edit "$GITHUB_SHA"
 
+          # Add skip-ci to prevent another workflow execution
+
           git commit --amend \
-            -m "Revert failed PHP commit [skip ci]"
+            -m "Revert failed PHP validation [skip ci]"
+
+          # Push the restored version
 
           git push origin HEAD:main
 
-          echo "GitHub repository restored to previous version."
+          echo "Previous GitHub version restored."
 
       # ==========================================
       # 5. INSTALL FTP CLIENT
@@ -132,13 +143,15 @@ jobs:
 
       - name: Install FTP Client
         if: steps.validate.outcome == 'success'
+
         run: |
 
           sudo apt-get update
+
           sudo apt-get install -y lftp curl
 
       # ==========================================
-      # 6. BACKUP LIVE WEBSITE
+      # 6. BACKUP LIVE INFINITYFREE WEBSITE
       # ==========================================
 
       - name: Backup InfinityFree Website
@@ -155,7 +168,9 @@ jobs:
 
           mkdir -p remote-backup
 
-          echo "Backing up current live website..."
+          echo "======================================"
+          echo "BACKING UP LIVE WEBSITE"
+          echo "======================================"
 
           lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
 
@@ -163,7 +178,7 @@ jobs:
           set ftp:ssl-allow yes
           set ftp:list-options -a
           set net:timeout 30
-          set net:max-retries 2
+          set net:max-retries 3
 
           mirror --verbose \
             "$FTP_REMOTE_DIR" \
@@ -175,13 +190,13 @@ jobs:
 
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
-          echo "Live website backup completed."
+          echo "Website backup completed."
 
       # ==========================================
       # 7. DEPLOY ENTIRE PROJECT
       # ==========================================
 
-      - name: Deploy Website Through FTP
+      - name: Deploy Entire Website Through FTP
         id: deployment
         if: steps.validate.outcome == 'success'
 
@@ -193,17 +208,20 @@ jobs:
 
         run: |
 
-          echo "Deploying entire project..."
+          echo "======================================"
+          echo "DEPLOYING ENTIRE PROJECT"
+          echo "======================================"
 
           lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
 
           set cmd:fail-exit yes
           set ftp:ssl-allow yes
           set net:timeout 30
-          set net:max-retries 2
+          set net:max-retries 3
 
           mirror --reverse \
             --verbose \
+            --overwrite \
             --no-perms \
             --parallel=2 \
             --exclude-glob .git \
@@ -217,10 +235,10 @@ jobs:
 
           EOF
 
-          echo "Website deployment completed."
+          echo "Entire project deployed successfully."
 
       # ==========================================
-      # 8. VERIFY WEBSITE
+      # 8. VERIFY LIVE WEBSITE
       # ==========================================
 
       - name: Verify Live Website
@@ -230,23 +248,53 @@ jobs:
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
 
+        shell: bash
         run: |
 
-          echo "Checking live website..."
+          echo "======================================"
+          echo "VERIFYING LIVE WEBSITE"
+          echo "======================================"
+
+          HTTP_STATUS=""
+          CURL_EXIT=0
 
           HTTP_STATUS=$(curl \
+            --http1.1 \
             -L \
-            -s \
+            -sS \
             -o /tmp/website.html \
             -w "%{http_code}" \
-            --max-time 30 \
-            "$SITE_URL")
+            -H "Cache-Control: no-cache" \
+            -H "Pragma: no-cache" \
+            --connect-timeout 15 \
+            --max-time 45 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            "$SITE_URL") || CURL_EXIT=$?
 
           echo "HTTP Status: $HTTP_STATUS"
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+
+            echo "Website connection failed."
+            echo "Curl error: $CURL_EXIT"
+
+            exit 1
+
+          fi
+
+          if ! [[ "$HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
+
+            echo "Invalid HTTP response."
+            exit 1
+
+          fi
 
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 400 ]]; then
 
             echo "Website verification failed."
+
             exit 1
 
           fi
@@ -254,7 +302,7 @@ jobs:
           echo "Website is accessible."
 
       # ==========================================
-      # 9. RESTORE LIVE WEBSITE IF DEPLOYMENT FAILS
+      # 9. RESTORE WEBSITE IF DEPLOYMENT FAILS
       # ==========================================
 
       - name: Rollback InfinityFree Website
@@ -279,7 +327,7 @@ jobs:
           set ftp:ssl-allow yes
           set ftp:list-options -a
           set net:timeout 30
-          set net:max-retries 2
+          set net:max-retries 3
 
           mirror --reverse \
             --delete \
@@ -291,7 +339,7 @@ jobs:
 
           EOF
 
-          echo "Previous website restoration completed."
+          echo "Previous website restored."
 
       # ==========================================
       # 10. FINAL SUMMARY
@@ -307,8 +355,11 @@ jobs:
           echo "======================================"
 
           echo "Validation: ${{ steps.validate.outcome }}"
+
           echo "Backup: ${{ steps.backup.outcome }}"
+
           echo "Deployment: ${{ steps.deployment.outcome }}"
+
           echo "Verification: ${{ steps.verification.outcome }}"
 
           echo "======================================"
