@@ -203,5 +203,5 @@ $currentTime = date("h:i:s A");
     </script>
 
 </body>
-<footer>test</footer>
+
 </html>
