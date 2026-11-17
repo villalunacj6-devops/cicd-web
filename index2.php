@@ -177,7 +177,11 @@ $currentTime = date("h:i:s A");
 
         <p class="mb-0">
             &copy; <?php echo date("Y"); ?>
+<<<<<<< HEAD
             My PHP CI/CD Website version 4.0
+=======
+            My PHP CI/CD Website version 3.5
+>>>>>>> 1a1c18c495770b165c34fb8fee4c7e4ab9d4536a
         </p>
 
     </footer>
