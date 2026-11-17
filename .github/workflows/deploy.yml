@@ -1,219 +1,129 @@
 
-name: PHP CI/CD - InfinityFree FTP
+name: PHP CI/CD - InfinityFree
 
 on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: infinityfree-production
+  group: infinityfree-deployment
   cancel-in-progress: false
 
 jobs:
-
-  deploy:
-
-    name: Test, Backup and Deploy
+  test:
+    name: Test Pushed PHP Files
     runs-on: ubuntu-latest
 
+    outputs:
+      test_result: ${{ steps.check.outputs.result }}
+
     steps:
-
-      # ==========================================
-      # 1. CHECKOUT PROJECT
-      # ==========================================
-
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
-      # ==========================================
-      # 2. INSTALL PHP
-      # ==========================================
-
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.2'
-          coverage: none
-
-      # ==========================================
-      # 3. TEST ALL PHP FILES
-      # ==========================================
-
-      - name: Validate PHP Syntax
-        id: validate
+      - name: Test PHP Files
+        id: check
         shell: bash
         run: |
-
-          echo "======================================"
-          echo "PHP SYNTAX VALIDATION"
-          echo "======================================"
-
-          FAIL=0
+          FAILED=0
           COUNT=0
 
-          while IFS= read -r -d '' FILE; do
+          FILES=$(git diff-tree --no-commit-id \
+            --name-only -r "$GITHUB_SHA" -- '*.php')
 
-            echo ""
-            echo "Checking: $FILE"
+          if [ -z "$FILES" ]; then
+            echo "No PHP files changed."
+          fi
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
 
             COUNT=$((COUNT + 1))
 
             if php -l "$FILE"; then
-
               echo "PASS: $FILE"
-
             else
-
-              echo "FAIL: $FILE"
-              FAIL=1
-
+              echo "FAILED: $FILE"
+              FAILED=1
             fi
+          done <<< "$FILES"
 
-          done < <(git ls-files -z -- '*.php')
+          echo "Files tested: $COUNT"
 
-          echo ""
-          echo "======================================"
-          echo "VALIDATION SUMMARY"
-          echo "======================================"
-
-          echo "PHP files checked: $COUNT"
-
-          echo "PHP files passed: $((COUNT - FAIL))"
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: No PHP files found."
+          if [ "$FAILED" -eq 1 ]; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          if [ "$FAIL" -ne 0 ]; then
+          echo "result=passed" >> "$GITHUB_OUTPUT"
 
-            echo "ERROR: PHP syntax validation failed."
-            exit 1
+  rollback:
+    name: Rollback Failed Files
+    needs: test
+    if: failure() && needs.test.result == 'failure'
+    runs-on: ubuntu-latest
 
-          fi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-          echo "SUCCESS: All PHP files passed."
-
-      # ==========================================
-      # 4. REVERT FAILED COMMIT IN GITHUB
-      # ==========================================
-
-      - name: Revert Failed Commit
-        if: failure() && steps.validate.outcome == 'failure'
-
+      - name: Restore Previous PHP Files
         run: |
-
-          echo "======================================"
-          echo "PHP VALIDATION FAILED"
-          echo "RESTORING PREVIOUS GITHUB VERSION"
-          echo "======================================"
-
           git config user.name "github-actions[bot]"
-
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Revert the failed commit
+          FAILED_FILES=$(git diff-tree --no-commit-id \
+            --name-only -r "$GITHUB_SHA" -- '*.php')
 
-          git revert --no-edit "$GITHUB_SHA"
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
 
-          # Add skip-ci to prevent another workflow execution
+            if git cat-file -e "$GITHUB_SHA^:$FILE" 2>/dev/null; then
+              git restore --source="$GITHUB_SHA^" \
+                --staged --worktree -- "$FILE"
+            else
+              git rm -f --ignore-unmatch "$FILE"
+            fi
+          done <<< "$FAILED_FILES"
 
-          git commit --amend \
-            -m "Revert failed PHP validation [skip ci]"
+          if ! git diff --cached --quiet; then
+            git commit -m "Rollback failed PHP files [skip ci]"
+            git push origin HEAD:main
+          fi
 
-          # Push the restored version
+  deploy:
+    name: Deploy Passed Files
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
 
-          git push origin HEAD:main
-
-          echo "Previous GitHub version restored."
-
-      # ==========================================
-      # 5. INSTALL FTP CLIENT
-      # ==========================================
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install FTP Client
-        if: steps.validate.outcome == 'success'
-
         run: |
-
           sudo apt-get update
+          sudo apt-get install -y lftp
 
-          sudo apt-get install -y lftp curl
-
-      # ==========================================
-      # 6. BACKUP LIVE INFINITYFREE WEBSITE
-      # ==========================================
-
-      - name: Backup InfinityFree Website
-        id: backup
-        if: steps.validate.outcome == 'success'
-
+      - name: Deploy to InfinityFree
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
-
         run: |
-
-          mkdir -p remote-backup
-
-          echo "======================================"
-          echo "BACKING UP LIVE WEBSITE"
-          echo "======================================"
-
           lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-
-          set cmd:fail-exit yes
-          set ftp:ssl-allow yes
-          set ftp:list-options -a
-          set net:timeout 30
-          set net:max-retries 3
-
-          mirror --verbose \
-            "$FTP_REMOTE_DIR" \
-            "$GITHUB_WORKSPACE/remote-backup"
-
-          bye
-
-          EOF
-
-          echo "ready=true" >> "$GITHUB_OUTPUT"
-
-          echo "Website backup completed."
-
-      # ==========================================
-      # 7. DEPLOY ENTIRE PROJECT
-      # ==========================================
-
-      - name: Deploy Entire Website Through FTP
-        id: deployment
-        if: steps.validate.outcome == 'success'
-
-        env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
-
-        run: |
-
-          echo "======================================"
-          echo "DEPLOYING ENTIRE PROJECT"
-          echo "======================================"
-
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-
           set cmd:fail-exit yes
           set ftp:ssl-allow yes
           set net:timeout 30
@@ -223,143 +133,31 @@ jobs:
             --verbose \
             --overwrite \
             --no-perms \
-            --parallel=2 \
             --exclude-glob .git \
             --exclude-glob .github \
             --exclude-glob .env \
             --exclude-glob '.env.*' \
-            ./ \
-            "$FTP_REMOTE_DIR/"
+            ./ "$FTP_REMOTE_DIR/"
 
           bye
-
           EOF
 
-          echo "Entire project deployed successfully."
+  summary:
+    name: CI/CD Summary
+    needs: [test, rollback, deploy]
+    if: always()
+    runs-on: ubuntu-latest
 
-      # ==========================================
-      # 8. VERIFY LIVE WEBSITE
-      # ==========================================
-
-      - name: Verify Live Website
-        id: verification
-        if: steps.validate.outcome == 'success'
-
-        env:
-          SITE_URL: ${{ secrets.SITE_URL }}
-
-        shell: bash
+    steps:
+      - name: Show Summary
         run: |
-
-          echo "======================================"
-          echo "VERIFYING LIVE WEBSITE"
-          echo "======================================"
-
-          HTTP_STATUS=""
-          CURL_EXIT=0
-
-          HTTP_STATUS=$(curl \
-            --http1.1 \
-            -L \
-            -sS \
-            -o /tmp/website.html \
-            -w "%{http_code}" \
-            -H "Cache-Control: no-cache" \
-            -H "Pragma: no-cache" \
-            --connect-timeout 15 \
-            --max-time 45 \
-            --retry 3 \
-            --retry-all-errors \
-            --retry-delay 5 \
-            "$SITE_URL") || CURL_EXIT=$?
-
-          echo "HTTP Status: $HTTP_STATUS"
-
-          if [ "$CURL_EXIT" -ne 0 ]; then
-
-            echo "Website connection failed."
-            echo "Curl error: $CURL_EXIT"
-
-            exit 1
-
-          fi
-
-          if ! [[ "$HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
-
-            echo "Invalid HTTP response."
-            exit 1
-
-          fi
-
-          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 400 ]]; then
-
-            echo "Website verification failed."
-
-            exit 1
-
-          fi
-
-          echo "Website is accessible."
-
-      # ==========================================
-      # 9. RESTORE WEBSITE IF DEPLOYMENT FAILS
-      # ==========================================
-
-      - name: Rollback InfinityFree Website
-        if: failure() && steps.backup.outputs.ready == 'true'
-
-        env:
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
-
-        run: |
-
-          echo "======================================"
-          echo "DEPLOYMENT FAILED"
-          echo "RESTORING PREVIOUS WEBSITE"
-          echo "======================================"
-
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-
-          set cmd:fail-exit yes
-          set ftp:ssl-allow yes
-          set ftp:list-options -a
-          set net:timeout 30
-          set net:max-retries 3
-
-          mirror --reverse \
-            --delete \
-            --verbose \
-            remote-backup/ \
-            "$FTP_REMOTE_DIR/"
-
-          bye
-
-          EOF
-
-          echo "Previous website restored."
-
-      # ==========================================
-      # 10. FINAL SUMMARY
-      # ==========================================
-
-      - name: CI/CD Summary
-        if: always()
-
-        run: |
-
-          echo "======================================"
-          echo "GITHUB ACTIONS CI/CD SUMMARY"
-          echo "======================================"
-
-          echo "Validation: ${{ steps.validate.outcome }}"
-
-          echo "Backup: ${{ steps.backup.outcome }}"
-
-          echo "Deployment: ${{ steps.deployment.outcome }}"
-
-          echo "Verification: ${{ steps.verification.outcome }}"
-
-          echo "======================================"
+          {
+            echo "## PHP CI/CD Summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| PHP Test | ${{ needs.test.result }} |"
+            echo "| Rollback | ${{ needs.rollback.result }} |"
+            echo "| Deployment | ${{ needs.deploy.result }} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"

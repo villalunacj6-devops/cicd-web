@@ -177,7 +177,7 @@ $currentTime = date("h:i:s A");
 
         <p class="mb-0">
             &copy; <?php echo date("Y"); ?>
-            My PHP CI/CD Website
+            My PHP CI/CD Website version 2
         </p>
 
     </footer>
