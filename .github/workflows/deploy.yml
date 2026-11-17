@@ -5,47 +5,60 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: infinityfree-deployment
+  group: infinityfree-production
   cancel-in-progress: false
 
 jobs:
+
+  # ========================================
+  # 1. TEST ALL PHP FILES
+  # ========================================
+
   test:
-    name: Test Pushed PHP Files
+    name: PHP Syntax Test
     runs-on: ubuntu-latest
 
     outputs:
-      test_result: ${{ steps.check.outputs.result }}
+      result: ${{ steps.php_test.outputs.result }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Test PHP Files
-        id: check
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: Validate PHP Files
+        id: php_test
         shell: bash
         run: |
+          echo "================================"
+          echo "PHP SYNTAX VALIDATION"
+          echo "================================"
+
           FAILED=0
           COUNT=0
 
-          FILES=$(git diff-tree --no-commit-id \
-            --name-only -r "$GITHUB_SHA" -- '*.php')
+          mapfile -d '' -t FILES < <(
+            git ls-files -z -- '*.php'
+          )
 
-          if [ -z "$FILES" ]; then
-            echo "No PHP files changed."
-          fi
-
-          while IFS= read -r FILE; do
-            [ -z "$FILE" ] && continue
+          for FILE in "${FILES[@]}"; do
 
             COUNT=$((COUNT + 1))
+
+            echo ""
+            echo "Checking: $FILE"
 
             if php -l "$FILE"; then
               echo "PASS: $FILE"
@@ -53,62 +66,115 @@ jobs:
               echo "FAILED: $FILE"
               FAILED=1
             fi
-          done <<< "$FILES"
 
-          echo "Files tested: $COUNT"
+          done
 
-          if [ "$FAILED" -eq 1 ]; then
+          echo ""
+          echo "PHP FILES CHECKED: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No PHP files found."
             echo "result=failed" >> "$GITHUB_OUTPUT"
-            exit 1
+            exit 0
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            echo "PHP VALIDATION FAILED."
+            exit 0
           fi
 
           echo "result=passed" >> "$GITHUB_OUTPUT"
+          echo "ALL PHP FILES PASSED."
+
+  # ========================================
+  # 2. ROLLBACK FAILED PHP FILES
+  # ========================================
 
   rollback:
-    name: Rollback Failed Files
+    name: Rollback Failed PHP Files
     needs: test
-    if: failure() && needs.test.result == 'failure'
+
+    if: |
+      needs.test.outputs.result == 'failed' &&
+      github.event.before != '0000000000000000000000000000000000000000'
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Restore Previous PHP Files
+        env:
+          BEFORE: ${{ github.event.before }}
+          CURRENT: ${{ github.sha }}
+
         run: |
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          FAILED_FILES=$(git diff-tree --no-commit-id \
-            --name-only -r "$GITHUB_SHA" -- '*.php')
+          mapfile -d '' -t FILES < <(
+            git diff --name-only -z \
+              "$BEFORE" "$CURRENT" -- '*.php'
+          )
 
-          while IFS= read -r FILE; do
-            [ -z "$FILE" ] && continue
+          echo "================================"
+          echo "ROLLBACK PHP FILES"
+          echo "================================"
 
-            if git cat-file -e "$GITHUB_SHA^:$FILE" 2>/dev/null; then
-              git restore --source="$GITHUB_SHA^" \
-                --staged --worktree -- "$FILE"
+          for FILE in "${FILES[@]}"; do
+
+            echo "Restoring: $FILE"
+
+            if git cat-file -e "$BEFORE:$FILE" 2>/dev/null; then
+
+              git restore \
+                --source="$BEFORE" \
+                --staged \
+                --worktree \
+                -- "$FILE"
+
             else
-              git rm -f --ignore-unmatch "$FILE"
+
+              git rm -f --ignore-unmatch -- "$FILE" || true
+              rm -f -- "$FILE"
+
             fi
-          done <<< "$FAILED_FILES"
+
+          done
 
           if ! git diff --cached --quiet; then
+
             git commit -m "Rollback failed PHP files [skip ci]"
+
             git push origin HEAD:main
+
+            echo "ROLLBACK SUCCESSFUL."
+
+          else
+
+            echo "No changed PHP files needed restoration."
+
           fi
 
+  # ========================================
+  # 3. DEPLOY ONLY IF TEST PASSES
+  # ========================================
+
   deploy:
-    name: Deploy Passed Files
+    name: Deploy to InfinityFree
     needs: test
-    if: needs.test.result == 'success'
+
+    if: needs.test.outputs.result == 'passed'
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install FTP Client
@@ -116,14 +182,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lftp
 
-      - name: Deploy to InfinityFree
+      - name: Deploy Website
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+
         run: |
+          echo "================================"
+          echo "DEPLOYING WEBSITE"
+          echo "================================"
+
           lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+
           set cmd:fail-exit yes
           set ftp:ssl-allow yes
           set net:timeout 30
@@ -133,6 +205,7 @@ jobs:
             --verbose \
             --overwrite \
             --no-perms \
+            --parallel=2 \
             --exclude-glob .git \
             --exclude-glob .github \
             --exclude-glob .env \
@@ -140,24 +213,47 @@ jobs:
             ./ "$FTP_REMOTE_DIR/"
 
           bye
+
           EOF
+
+          echo "DEPLOYMENT SUCCESSFUL."
+
+  # ========================================
+  # 4. FINAL SUMMARY
+  # ========================================
 
   summary:
     name: CI/CD Summary
     needs: [test, rollback, deploy]
+
     if: always()
+
     runs-on: ubuntu-latest
 
     steps:
-      - name: Show Summary
+      - name: Display Results
+        env:
+          TEST: ${{ needs.test.outputs.result }}
+          ROLLBACK: ${{ needs.rollback.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+
         run: |
           {
-            echo "## PHP CI/CD Summary"
+            echo "# PHP CI/CD SUMMARY"
             echo ""
             echo "| Stage | Result |"
             echo "|---|---|"
-            echo "| PHP Test | ${{ needs.test.result }} |"
-            echo "| Rollback | ${{ needs.rollback.result }} |"
-            echo "| Deployment | ${{ needs.deploy.result }} |"
+            echo "| PHP Test | $TEST |"
+            echo "| Rollback | $ROLLBACK |"
+            echo "| Deployment | $DEPLOY |"
             echo ""
+            echo "Commit: $GITHUB_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "================================"
+          echo "FINAL CI/CD RESULTS"
+          echo "================================"
+
+          echo "PHP TEST: $TEST"
+          echo "ROLLBACK: $ROLLBACK"
+          echo "DEPLOYMENT: $DEPLOY"

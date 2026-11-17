@@ -176,7 +176,7 @@ $currentTime = date("h:i:s A");
     <footer class="bg-dark text-white text-center py-3">
 
         <p class="mb-0">
-            &copy; <?php echo date("Y"); ?>
+            &copy; <?php echs date("xs"); ?>
             My PHP CI/CD Website version 3.5
         </p>
 
