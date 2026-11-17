@@ -120,7 +120,7 @@ $currentTime = date("h:i:s A");
                                     </h6>
 
                                     <h5>
-                                        <?php echo $currentTime; ?>
+                                        <?php echo currentTime; ?>
                                     </h5>
 
                                 </div>
@@ -176,7 +176,7 @@ $currentTime = date("h:i:s A");
     <footer class="bg-dark text-white text-center py-3">
 
         <p class="mb-0">
-            &copy; <?php echo date("Y") ?>
+            &copy; <?php date("Y") ?>
             My PHP CI/CD Website version 2
         </p>
 
