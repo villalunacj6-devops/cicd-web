@@ -1,0 +1,314 @@
+
+name: PHP CI/CD - InfinityFree FTP
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: infinityfree-production
+  cancel-in-progress: false
+
+jobs:
+
+  deploy:
+
+    name: Test, Backup and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ==========================================
+      # 1. CHECKOUT PROJECT
+      # ==========================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==========================================
+      # 2. INSTALL PHP
+      # ==========================================
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      # ==========================================
+      # 3. TEST ALL PHP FILES
+      # ==========================================
+
+      - name: Validate PHP Syntax
+        id: validate
+        shell: bash
+        run: |
+
+          echo "======================================"
+          echo "PHP SYNTAX VALIDATION"
+          echo "======================================"
+
+          FAIL=0
+          COUNT=0
+
+          while IFS= read -r -d '' FILE; do
+
+            echo ""
+            echo "Checking: $FILE"
+
+            COUNT=$((COUNT + 1))
+
+            if php -l "$FILE"; then
+
+              echo "PASS: $FILE"
+
+            else
+
+              echo "FAIL: $FILE"
+              FAIL=1
+
+            fi
+
+          done < <(git ls-files -z -- '*.php')
+
+          echo ""
+          echo "======================================"
+          echo "VALIDATION SUMMARY"
+          echo "======================================"
+
+          echo "PHP files checked: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No PHP files found."
+            exit 1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+
+            echo "PHP validation failed."
+            exit 1
+
+          fi
+
+          echo "All PHP files passed."
+
+      # ==========================================
+      # 4. REVERT FAILED COMMIT IN GITHUB
+      # ==========================================
+
+      - name: Revert Failed Commit
+        if: failure() && steps.validate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+
+          echo "======================================"
+          echo "PHP TEST FAILED"
+          echo "REVERTING FAILED COMMIT"
+          echo "======================================"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git revert --no-edit "$GITHUB_SHA"
+
+          git commit --amend \
+            -m "Revert failed PHP commit [skip ci]"
+
+          git push origin HEAD:main
+
+          echo "GitHub repository restored to previous version."
+
+      # ==========================================
+      # 5. INSTALL FTP CLIENT
+      # ==========================================
+
+      - name: Install FTP Client
+        if: steps.validate.outcome == 'success'
+        run: |
+
+          sudo apt-get update
+          sudo apt-get install -y lftp curl
+
+      # ==========================================
+      # 6. BACKUP LIVE WEBSITE
+      # ==========================================
+
+      - name: Backup InfinityFree Website
+        id: backup
+        if: steps.validate.outcome == 'success'
+
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+
+        run: |
+
+          mkdir -p remote-backup
+
+          echo "Backing up current live website..."
+
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+
+          set cmd:fail-exit yes
+          set ftp:ssl-allow yes
+          set ftp:list-options -a
+          set net:timeout 30
+          set net:max-retries 2
+
+          mirror --verbose \
+            "$FTP_REMOTE_DIR" \
+            "$GITHUB_WORKSPACE/remote-backup"
+
+          bye
+
+          EOF
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+          echo "Live website backup completed."
+
+      # ==========================================
+      # 7. DEPLOY ENTIRE PROJECT
+      # ==========================================
+
+      - name: Deploy Website Through FTP
+        id: deployment
+        if: steps.validate.outcome == 'success'
+
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+
+        run: |
+
+          echo "Deploying entire project..."
+
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+
+          set cmd:fail-exit yes
+          set ftp:ssl-allow yes
+          set net:timeout 30
+          set net:max-retries 2
+
+          mirror --reverse \
+            --verbose \
+            --no-perms \
+            --parallel=2 \
+            --exclude-glob .git \
+            --exclude-glob .github \
+            --exclude-glob .env \
+            --exclude-glob '.env.*' \
+            ./ \
+            "$FTP_REMOTE_DIR/"
+
+          bye
+
+          EOF
+
+          echo "Website deployment completed."
+
+      # ==========================================
+      # 8. VERIFY WEBSITE
+      # ==========================================
+
+      - name: Verify Live Website
+        id: verification
+        if: steps.validate.outcome == 'success'
+
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+
+        run: |
+
+          echo "Checking live website..."
+
+          HTTP_STATUS=$(curl \
+            -L \
+            -s \
+            -o /tmp/website.html \
+            -w "%{http_code}" \
+            --max-time 30 \
+            "$SITE_URL")
+
+          echo "HTTP Status: $HTTP_STATUS"
+
+          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 400 ]]; then
+
+            echo "Website verification failed."
+            exit 1
+
+          fi
+
+          echo "Website is accessible."
+
+      # ==========================================
+      # 9. RESTORE LIVE WEBSITE IF DEPLOYMENT FAILS
+      # ==========================================
+
+      - name: Rollback InfinityFree Website
+        if: failure() && steps.backup.outputs.ready == 'true'
+
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+
+        run: |
+
+          echo "======================================"
+          echo "DEPLOYMENT FAILED"
+          echo "RESTORING PREVIOUS WEBSITE"
+          echo "======================================"
+
+          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+
+          set cmd:fail-exit yes
+          set ftp:ssl-allow yes
+          set ftp:list-options -a
+          set net:timeout 30
+          set net:max-retries 2
+
+          mirror --reverse \
+            --delete \
+            --verbose \
+            remote-backup/ \
+            "$FTP_REMOTE_DIR/"
+
+          bye
+
+          EOF
+
+          echo "Previous website restoration completed."
+
+      # ==========================================
+      # 10. FINAL SUMMARY
+      # ==========================================
+
+      - name: CI/CD Summary
+        if: always()
+
+        run: |
+
+          echo "======================================"
+          echo "GITHUB ACTIONS CI/CD SUMMARY"
+          echo "======================================"
+
+          echo "Validation: ${{ steps.validate.outcome }}"
+          echo "Backup: ${{ steps.backup.outcome }}"
+          echo "Deployment: ${{ steps.deployment.outcome }}"
+          echo "Verification: ${{ steps.verification.outcome }}"
+
+          echo "======================================"
