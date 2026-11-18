@@ -1,13 +1,13 @@
 
 <?php
 
-$websiteName = "My PHP CI/CD Website by Harvey and Kervs"; 
+$websiteName = "My PHP CI/CD Website by Harvey and Kervs";
 $message = "Successfully deployed using GitHub Actions and InfinityFree FTP!";
 
-$currentDate = date("F d, Y")
-$currentTime = date("h:i:s A")
+$currentDate = date("F d, Y");
+$currentTime = date("h:i:s A");
 
-
+?>
 
 <!DOCTYPE html>
 <html lang="en">
