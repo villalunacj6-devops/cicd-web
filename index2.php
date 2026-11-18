@@ -1,7 +1,7 @@
 
 <?php
 
-$websiteName = "My PHP CI/CD Website";
+$websiteName = "My PHP CI/CD Website by Harvey and Kervs";
 $message = "Successfully deployed using GitHub Actions and InfinityFree FTP!";
 
 $currentDate = date("F d, Y");
